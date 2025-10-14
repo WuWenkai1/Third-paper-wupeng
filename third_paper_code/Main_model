@@ -1,1 +1,386 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import random
+from typing import List, Dict, Tuple, Optional
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ========= 读取你的数据 =========
+from parameter import combined_orders_dict, special_seq_indices
+try:
+    from parameter import num_normal_orders as _NUM_NORMAL_ORDERS
+except Exception:
+    _NUM_NORMAL_ORDERS = None
+# ========= 全局设置 =========
+SEED = 12
+random.seed(SEED)
+np.random.seed(SEED)
+NUM_OPS_BODY = 3
+NUM_OPS_CABINET = 5
+POP_SIZE = 40
+ITERS_A = 800  # 求Z
+ITERS_B = 2000  # 最小化PT
+
+SCENARIO_AS = [0.3, 0.4, 0.5, 0.6, 0.7]
+# ========== 规范化输入 ==========
+def normalize_input():
+    order_ids = list(combined_orders_dict.keys())
+    orders = [combined_orders_dict[oid] for oid in order_ids]
+    N = len(orders)
+    id2idx = {oid:i for i,oid in enumerate(order_ids)}  #{1: 0, 2: 1, 3: 2}
+    idx2id = {i:oid for oid,i in id2idx.items()}        #{0: 1, 1: 2, 2: 3}
+
+    for o in orders:
+        o["proc_body"]    = np.asarray(o.get("proc_body", [0]*NUM_OPS_BODY), dtype=float)
+        o["proc_cabinet"] = np.asarray(o.get("proc_cabinet", [0]*NUM_OPS_CABINET), dtype=float)
+        o["proc_pipe"]    = float(o.get("proc_pipe", 0.0))
+        o["release"]      = float(o.get("release", 0.0))
+        o["due"]          = float(o.get("due", 1e12))
+        o["profit"]       = float(o.get("profit", 0.0))
+        o["AC"]           = float(o.get("AC", 0.0))
+        o["penalty"]      = float(o.get("penalty", 0.0))
+        o["is_special"]   = bool(o.get("is_special", False))
+
+    specials_all = [i for i,o in enumerate(orders) if o["is_special"]]
+    if not specials_all:
+        raise ValueError("没有检测到 is_special=True 的订单，请检查 parameter.py")
+
+    pos = [int(x) for x in special_seq_indices]
+    L = len(specials_all)
+    mn, mx = min(pos), max(pos)
+    if 0 <= mn and mx < L:           # 0-based 位置
+        special_prefix = [specials_all[p] for p in pos]
+    elif 1 <= mn and mx <= L:        # 1-based 位置
+        special_prefix = [specials_all[p-1] for p in pos]
+    else:
+        def as_idx(x):
+            if x in id2idx: return id2idx[x]
+            if 0 <= x < N:  return x
+            return None
+        mapped = [as_idx(x) for x in pos]
+        if any(m is None for m in mapped):
+            raise ValueError("special_seq_indices 无法映射到内部索引/位置")
+        special_prefix = mapped
+
+    special_set = set(special_prefix)
+    normals = [i for i in range(N) if i not in special_set]
+    return orders, special_prefix, special_set, normals, N
+
+orders, special_prefix, special_set, normal_indices, N = normalize_input()
+PREFIX_LEN = len(special_prefix)
+
+# ========= 反向锚定特殊订单（卡在交期）并抽取“缝隙(背包)” =========
+def _build_gaps_from_occupancy(occ: List[Tuple[float,float]], start: float, end: float):
+    """给定占用区间列表（已排序不重叠），生成空隙列表"""
+    gaps = []
+    cur = start
+    for s,e in occ:
+        if s > cur + 1e-12:
+            gaps.append((cur, s))
+        cur = max(cur, e)
+    if cur < end - 1e-12:
+        gaps.append((cur, end))
+    return gaps
+
+def anchor_specials_and_gaps() -> Tuple[Dict[int,Dict], Dict[str, List[Tuple[float,float]]]]:
+    """
+    把每个特殊订单按给定顺序在三条线上“卡住交期”：
+      - 管线包：按 special_prefix 逆序，令每个 job 的管线包完工=C_pipe=due，并保证单机容量（逆序向右移）
+      - 本体/电柜：每个 job 的这两条线的完工 <= 管线包开工（S_pipe），分别做多机串行反向排程
+      - 如因 release 需整体右移，仍不越过 S_pipe（题设保证可行）
+    产出：
+      plan_spec[j] = {S/C 的三线时间}
+      gaps = {'body_k':[(a,b)], 'cabinet_k':[(a,b)], 'pipe':[(a,b)]}
+    """
+    # -------- 管线包（单机）先锚定到 due --------
+    occ_pipe = []  # 已被占用的区间（从0到HORIZON）
+    H = max(float(orders[j]["due"]) for j in special_prefix) + 1e5  # 终点
+    latest_free = float('inf')
+    plan_spec: Dict[int,Dict] = {}
+    # 逆序排：后一个不能与前一个重叠（因为是单机）
+    for j in reversed(special_prefix):
+        p = float(orders[j]["proc_pipe"])
+        d = float(orders[j]["due"])
+        # 先把完工对齐到 due，再与后面的占用取 min
+        C_pipe = min(d, latest_free)
+        S_pipe = C_pipe - p
+        # 如果有释放期要求？管线包没有释放期，但受前两线完工限制，先不处理
+        plan_spec.setdefault(j, {})["S_pipe"] = S_pipe
+        plan_spec[j]["C_pipe"] = C_pipe
+        latest_free = S_pipe  # 留给更早的任务
+
+    # -------- 本体/电柜线：多机串行反向排程（完工<=S_pipe） --------
+    def backward_flow_for_job(job:int, S_dead: float, m: int, proc: np.ndarray,
+                              Lend: List[float]) -> Tuple[np.ndarray, np.ndarray, bool]:
+        """
+        对单个 job 在 m 台串行机上做反排：C_{m-1}<=S_dead，且 C_k<=Lend[k]。
+        返回 S_vec, C_vec，若因 release 右移后越过 S_dead 则返回 False。
+        """
+        S = np.zeros(m, dtype=float); C = np.zeros(m, dtype=float)
+        # 最后一个工位的完工上限
+        C[m-1] = min(S_dead, Lend[m-1])
+        S[m-1] = C[m-1] - float(proc[m-1])
+        # 其余工位
+        for k in range(m-2, -1, -1):
+            C[k] = min(S[k+1], Lend[k])
+            S[k] = C[k] - float(proc[k])
+        # 释放期校正（只对第一工位）
+        rel = float(orders[job]["release"])
+        if S[0] < rel - 1e-12:
+            delta = rel - S[0]
+            S += delta; C += delta
+            if C[m-1] > S_dead + 1e-12:
+                return S, C, False
+        return S, C, True
+
+    # body
+    Lend_b = [float('inf')]*NUM_OPS_BODY
+    occ_body_by_machine = [[] for _ in range(NUM_OPS_BODY)]
+    # cabinet
+    Lend_c = [float('inf')]*NUM_OPS_CABINET
+    occ_cab_by_machine = [[] for _ in range(NUM_OPS_CABINET)]
+
+    # 针对每个特殊订单，先用它的 S_pipe 作为两条线的“完工上限”
+    for j in reversed(special_prefix):
+        S_dead = plan_spec[j]["S_pipe"]
+        # 本体
+        Sb, Cb, okb = backward_flow_for_job(j, S_dead, NUM_OPS_BODY, orders[j]["proc_body"], Lend_b)
+        # 电柜
+        Sc, Cc, okc = backward_flow_for_job(j, S_dead, NUM_OPS_CABINET, orders[j]["proc_cabinet"], Lend_c)
+        if not (okb and okc):
+            # 题设保证可行；若出现则说明数据太紧，可在此小幅放松 S_dead（略）
+            pass
+        # 存入计划
+        plan_spec[j]["S_body"], plan_spec[j]["C_body"] = Sb, Cb
+        plan_spec[j]["S_cab"],  plan_spec[j]["C_cab"]  = Sc, Cc
+        # 更新各机最晚可完工时间窗口
+        for k in range(NUM_OPS_BODY):
+            Lend_b[k] = min(Lend_b[k], Sb[k])
+            occ_body_by_machine[k].append((Sb[k], Cb[k]))
+        for k in range(NUM_OPS_CABINET):
+            Lend_c[k] = min(Lend_c[k], Sc[k])
+            occ_cab_by_machine[k].append((Sc[k], Cc[k]))
+
+    # 管线包占用（由 plan_spec 给出）
+    occ_pipe = sorted([(plan_spec[j]["S_pipe"], plan_spec[j]["C_pipe"]) for j in special_prefix], key=lambda x:x[0])
+
+    # 整理为每台机的空隙
+    gaps = {}  # {'body_0':[(a,b)], ... 'cabinet_0':..., 'pipe':[(a,b)]}
+    for k in range(NUM_OPS_BODY):
+        occ = sorted(occ_body_by_machine[k], key=lambda x:x[0])
+        gaps[f"body_{k}"] = _build_gaps_from_occupancy(occ, 0.0, H)
+    for k in range(NUM_OPS_CABINET):
+        occ = sorted(occ_cab_by_machine[k], key=lambda x:x[0])
+        gaps[f"cabinet_{k}"] = _build_gaps_from_occupancy(occ, 0.0, H)
+    gaps["pipe"] = _build_gaps_from_occupancy(occ_pipe, 0.0, H)
+
+    return plan_spec, gaps
+
+#在某个空隙（gap）里安放了一段占用 [s, e] 之后，把原来的空隙切成剩余的左右两段，并更新 gaps 列表。
+def _split_gap(gaps: List[Tuple[float,float]], gi: int, s: float, e: float):
+    a,b = gaps[gi]   # 第 gi 个空隙原区间 [a, b]
+    left  = (a,s) if s > a+1e-12 else None
+    right = (e,b) if e < b-1e-12 else None
+    gaps.pop(gi)
+    if right: gaps.insert(gi, right)
+    if left:  gaps.insert(gi, left)
+
+# ========= 在“背包”中安放一个普通订单（若不行返回 None） =========
+def place_normal_in_gaps(j:int, gaps:Dict[str,List[Tuple[float,float]]]) -> Optional[Dict]:
+    """
+    同时在本体3机、电柜5机、管线包1机找到一条可行“时间链”：
+      body: 选 body_0..2 各一个 gap，串行不重叠
+      cab : 同理 5 个
+      pipe: 等待 max(C_body_last, C_cab_last)，再在 pipe 的某个 gap 上开始
+    找到则返回该订单的时间计划（含 S/C），并切割相应 gaps
+    """
+    p_b = orders[j]["proc_body"]
+    p_c = orders[j]["proc_cabinet"]
+    p_p = float(orders[j]["proc_pipe"])
+    rel = float(orders[j]["release"])
+
+    # 穷举/线扫：对 body 的 gap0->1->2 逐层推进“最早可行”，cabinet 同理
+    # 为控复杂度：贪心“各工位取扫描到的第一个可容纳 gap”
+    # body
+    Sb = np.zeros(NUM_OPS_BODY); Cb = np.zeros(NUM_OPS_BODY)
+    gi_b = [-1]*NUM_OPS_BODY
+    t = max(rel, 0.0)
+    ok = True
+    for k in range(NUM_OPS_BODY):
+        ok_k = False
+        for gi,(a,b) in enumerate(gaps[f"body_{k}"]):
+            s = max(t, a); e = s + float(p_b[k])
+            if e <= b + 1e-12:
+                Sb[k], Cb[k] = s,e
+                gi_b[k] = gi
+                t = e
+                ok_k = True
+                break
+        if not ok_k:
+            ok=False; break
+    if not ok: return None
+
+    # cabinet
+    Sc = np.zeros(NUM_OPS_CABINET); Cc = np.zeros(NUM_OPS_CABINET)
+    gi_c = [-1]*NUM_OPS_CABINET
+    t = max(rel, 0.0)
+    ok = True
+    for k in range(NUM_OPS_CABINET):
+        ok_k=False
+        for gi,(a,b) in enumerate(gaps[f"cabinet_{k}"]):  # gaps["body_k"] 是第 k 个工位当前所有“可用缝隙”的列表 [(a1,b1), (a2,b2), ...]
+            s = max(t, a); e = s + float(p_c[k])
+            if e <= b + 1e-12:
+                Sc[k], Cc[k] = s,e
+                gi_c[k] = gi
+                t = e
+                ok_k=True
+                break
+        if not ok_k:
+            ok=False; break
+    if not ok: return None
+
+    ready = max(Cb[-1], Cc[-1])
+    # pipe
+    gi_picked = -1
+    Sp = Cp = None
+    for gi,(a,b) in enumerate(gaps["pipe"]):
+        s = max(ready, a); e = s + p_p
+        if e <= b + 1e-12:
+            Sp, Cp = s, e
+            gi_picked = gi
+            break
+    if gi_picked < 0:  # 放不进
+        return None
+
+    # 切割 gaps
+    for k in range(NUM_OPS_BODY):
+        _split_gap(gaps[f"body_{k}"], gi_b[k], Sb[k], Cb[k])
+    for k in range(NUM_OPS_CABINET):
+        _split_gap(gaps[f"cabinet_{k}"], gi_c[k], Sc[k], Cc[k])
+    _split_gap(gaps["pipe"], gi_picked, Sp, Cp)
+
+    return {"S_body":Sb, "C_body":Cb, "S_cab":Sc, "C_cab":Cc, "S_pipe":Sp, "C_pipe":Cp}  #返回的是单个订单的数值
+
+# ========= 背包装填 + 尾部顺排（构造一份完整可行排程） =========
+def construct_schedule(priority_normals: Optional[np.ndarray]=None,
+                       tail_rule: str="EDD"):
+    """
+    1) 锚定特殊订单 -> 生成 gaps
+    2) 按给定“普通订单优先级”（大者先）尝试放入 gaps；放不进的进入 tail 未装入集
+    3) tail 集合用 tail_rule（默认 EDD）顺排接到特殊之后（追加时不再使用 gaps，只做顺序排）
+    4) 返回 info + 三线排列（以完工时间反解）
+    """
+    plan_spec, gaps = anchor_specials_and_gaps()
+
+    # 普通订单顺序
+    normals = list(normal_indices)
+    if priority_normals is not None:
+        idx = np.argsort(-priority_normals, kind="mergesort")
+        normals = [normals[i] for i in idx]
+    else:
+        # 默认也可以用 EDD 先装填（事实上的选择）
+        normals = sorted(normals, key=lambda j: orders[j]["due"])
+
+    plan_norm: Dict[int,Dict] = {}
+    tail = []
+
+    # 先装缝隙
+    for j in normals:
+        placed = place_normal_in_gaps(j, gaps)
+        if placed is None:
+            tail.append(j)
+        else:
+            plan_norm[j] = placed
+
+    # 尾部顺排：从“所有特殊之后”的时间点开始（即各线最后一个占用的结束时间）
+    # 先算各线当前“最后完工时间”
+    def last_time_of_line(linekey_prefix):
+        last = 0.0
+        for key, GL in gaps.items():
+            if not key.startswith(linekey_prefix): continue
+            # gaps 是空隙，最后一个空隙右端就是整条线的“尾巴”
+            if GL:
+                last = max(last, GL[-1][1])
+        return last
+    # 剩余订单的排序（WSPT）：按 p_eff / w 升序，平局再按 due
+    tail_rule_key = lambda j: (
+        (max(float(np.sum(orders[j]["proc_body"])),
+             float(np.sum(orders[j]["proc_cabinet"]))) + float(orders[j]["proc_pipe"]))
+        / max(1e-9, float(orders[j]["penalty"])),
+        float(orders[j]["due"])
+    )
+    tail_sorted = sorted(tail, key=tail_rule_key)
+
+    # 顺排尾部（不再用 gaps，直接接在各线尾）
+    # body
+    t_b = 0.0
+    for k in range(NUM_OPS_BODY): t_b = max(t_b, last_time_of_line("body_"))
+    # cabinet
+    t_c = 0.0
+    for k in range(NUM_OPS_CABINET): t_c = max(t_c, last_time_of_line("cabinet_"))
+    # pipe
+    t_p = last_time_of_line("pipe")
+
+    for j in tail_sorted:
+        # body
+        Sb = np.zeros(NUM_OPS_BODY); Cb = np.zeros(NUM_OPS_BODY)
+        tb = max(t_b, orders[j]["release"])
+        for k in range(NUM_OPS_BODY):
+            Sb[k] = tb
+            Cb[k] = tb + float(orders[j]["proc_body"][k])
+            tb = Cb[k]
+        # cabinet
+        Sc = np.zeros(NUM_OPS_CABINET); Cc = np.zeros(NUM_OPS_CABINET)
+        tc = max(t_c, orders[j]["release"])
+        for k in range(NUM_OPS_CABINET):
+            Sc[k] = tc
+            Cc[k] = tc + float(orders[j]["proc_cabinet"][k])
+            tc = Cc[k]
+        # pipe
+        ready = max(Cb[-1], Cc[-1], t_p)
+        Sp = ready
+        Cp = Sp + float(orders[j]["proc_pipe"])
+
+        plan_norm[j] = {"S_body":Sb, "C_body":Cb, "S_cab":Sc, "C_cab":Cc, "S_pipe":Sp, "C_pipe":Cp}
+        # 更新各线尾
+        t_b, t_c, t_p = Cb[-1], Cc[-1], Cp
+
+    # 合并计划
+    plan_all: Dict[int,Dict] = {}
+    plan_all.update(plan_spec)
+    plan_all.update(plan_norm)
+
+    # 由计划反推出三条线的排列：按每线首工位开始时间排序等价
+    perm_body  = sorted(range(N), key=lambda j: plan_all[j]["S_body"][0])
+    perm_cab   = sorted(range(N), key=lambda j: plan_all[j]["S_cab"][0])
+    perm_pipe  = sorted(range(N), key=lambda j: plan_all[j]["S_pipe"])
+    # 目标计算
+    pipe_finish = {j: plan_all[j]["C_pipe"] for j in range(N)}
+    makespan = max(pipe_finish.values()) if pipe_finish else 0.0
+
+    total_delay_cost = 0.0; tardy_count = 0
+    for j, pf in pipe_finish.items():
+        due = float(orders[j]["due"])
+        late = max(0.0, pf - due)
+        if late > 0.0:
+            tardy_count += 1
+            total_delay_cost += late * float(orders[j]["penalty"])
+
+    total_profit = sum(float(o["profit"]) for o in orders) - \
+                   sum(float(o["AC"])*(float(np.sum(o["proc_body"]))+float(np.sum(o["proc_cabinet"]))+float(o["proc_pipe"])) for o in orders) - \
+                   total_delay_cost
+
+    f_values = {}
+    for a in SCENARIO_AS:
+        b = 1.0 - a
+        f_values[a] = float(a*total_profit - b*1000.0*makespan)
+
+    info = {
+        "total_profit": total_profit,
+        "makespan": makespan,
+        "f_values": f_values,
+        "tardy_count": tardy_count,
+        "special_tardy_count": 0,  # 按题设固定锚定 -> 特殊不会迟到
+    }
+    return perm_body, perm_cab, perm_pipe, plan_all, info
 
