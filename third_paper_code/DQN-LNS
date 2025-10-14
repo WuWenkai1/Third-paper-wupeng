@@ -1,0 +1,482 @@
+
+# -*- coding: utf-8 -*-
+import math
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Dict, Optional
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ===== 你的模型封装（保持不变）=====
+from Main_model import (
+    orders, normal_indices, SCENARIO_AS,
+    anchor_specials_and_gaps, place_normal_in_gaps, construct_schedule
+)
+
+# ===== 全局与超参 =====
+SEED = 12
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+T_TARGET = 409_865.500  # 你给定的 Z
+
+# 训练/探索
+ITERS_B = 600
+EPISODES_PER_LNS = 1
+TOPK_PIPE_GAPS = 16
+EPSILON_START = 0.30
+EPSILON_END   = 0.03
+EPSILON_DECAY = 0.995
+GAMMA = 0.98
+LR    = 1e-3
+BATCH_SIZE = 256
+REPLAY_SIZE = 50000
+
+# Double DQN + 软更新
+TARGET_UPDATE_EVERY = 0          # 若=0则启用软更新，否则为步数周期硬更新
+TAU_SOFT = 0.01                  # 软更新系数
+
+# 优先经验回放（PER）
+PER_ALPHA = 0.6
+PER_BETA_START = 0.4
+PER_BETA_END   = 1.0
+PER_BETA_DECAY = 0.997
+PER_EPS = 1e-6
+
+# LNS
+LNS_RUIN_RATIO_INIT = 0.20
+LNS_RUIN_RATIO_MAX  = 0.60
+NO_IMPROVE_PATIENCE = 50
+PREFILL_GREEDY = True    # 先用 WSPT 填一部分 gap（可加速学习）
+PREFILL_RATIO  = 0.50    # 预填的普通单比例上限（0~1）
+
+# 设备
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ============== 评估封装（PT） ==============
+def eval_PT_from_priority(x: np.ndarray, Z: float) -> float:
+    _, _, _, _, info = construct_schedule(priority_normals=x, tail_rule="WSPT")
+    return float(sum(max(0.0, Z - float(info["f_values"][a])) for a in SCENARIO_AS))
+
+# ============== 环境（二维动作：选 (job, gap_idx)） ==============
+class GapEnv2DPlus:
+    """
+    相比基础版，增加：
+    - 可选“贪心预填缝”：先把一部分普通单按 WSPT 放入 gaps（减少冷启动难度）
+    - 状态特征更丰富：job 加 slack、密度等；gap 加相邻统计
+    - 动作仍是 (job, pipe_gap_slot_idx)，通过“裁剪 pipe gaps 为单个”实现定点插入
+    """
+    def __init__(self, Z_for_PT: float, topk_pipe_gaps: int = TOPK_PIPE_GAPS,
+                 prefill: bool = PREFILL_GREEDY, prefill_ratio: float = PREFILL_RATIO):
+        self.Z = Z_for_PT
+        self.topk = topk_pipe_gaps
+        self.N = len(normal_indices)
+        self.prefill = prefill
+        self.prefill_ratio = prefill_ratio
+        self.reset()
+
+    def _job_feat(self, j:int) -> np.ndarray:
+        pb = float(np.sum(orders[j]["proc_body"]))
+        pc = float(np.sum(orders[j]["proc_cabinet"]))
+        pp = float(orders[j]["proc_pipe"])
+        r  = float(orders[j]["release"])
+        d  = float(orders[j]["due"])
+        w  = float(orders[j]["penalty"])
+        pr = float(orders[j]["profit"])
+        ac = float(orders[j]["AC"])
+        p_eff = max(pb, pc) + pp
+        slack = d - r - p_eff
+        profit_density = (pr - ac * (pb+pc+pp)) / max(1e-6, p_eff)  # 单位时间净收益
+        return np.array([pb, pc, pp, p_eff, r, d, w, pr, ac, slack, profit_density], dtype=np.float32)
+
+    def _pipe_gap_feats(self) -> List[Tuple[float,float,float,float,float]]:
+        """返回 TOPK gaps 的 (start, end, length, dist_to_0, dist_to_lastC)"""
+        gaps = self.current_gaps["pipe"]
+        if not gaps:
+            gl = []
+        else:
+            # 基于长度排序
+            gl = [(a,b,b-a) for (a,b) in gaps]
+            gl.sort(key=lambda x: x[2], reverse=True)
+
+        # 辅助统计：距离“当前管线已排尾”的距离
+        tail_c = 0.0
+        # 用 gaps 估计尾部：最大的右端
+        if gaps:
+            tail_c = max(b for (a,b) in gaps)
+        out = []
+        for (a,b,L) in gl[:self.topk]:
+            out.append((a, b, L, a, max(0.0, a - tail_c)))
+        while len(out) < self.topk:
+            out.append((0.0,0.0,0.0,0.0,0.0))
+        return out
+
+    def _prefill_wspt_once(self):
+        """用 WSPT 先装一批，帮助冷启动；简单做法：对 normals 取前若干比例，逐个尝试“最早可行”"""
+        # 选出 normals 的一部分（按单位惩罚密度）
+        cand = list(normal_indices)
+        cand.sort(key=lambda j: (
+            (max(float(np.sum(orders[j]["proc_body"])),
+                 float(np.sum(orders[j]["proc_cabinet"]))) + float(orders[j]["proc_pipe"]))
+            / max(1e-9, float(orders[j]["penalty"]))
+        ))  # WSPT 近似
+        k = int(self.prefill_ratio * len(cand))
+        pick = cand[:k]
+        for j in pick:
+            placed = place_normal_in_gaps(j, self.current_gaps)
+            if placed is not None:
+                self.inserted[j] = placed
+
+    def reset(self):
+        # 锚定特殊单 -> 初始 gaps
+        self.plan_spec, self.gaps = anchor_specials_and_gaps()
+        self.current_gaps = {k: v.copy() for k, v in self.gaps.items()}
+        self.inserted: Dict[int, Dict] = {}
+        self.cannot_mask_pairs: set = set()
+        # 可选：先预填一批，降低稀疏奖励难度
+        if self.prefill:
+            self._prefill_wspt_once()
+        self._rebuild_masks()
+        return self._build_state()
+
+    def _rebuild_masks(self):
+        self.cannot_mask_pairs.clear()
+        self._gap_view = self._pipe_gap_feats()
+        for j in normal_indices:
+            if j in self.inserted:
+                for gi in range(self.topk):
+                    self.cannot_mask_pairs.add((j, gi))
+                continue
+            for gi in range(self.topk):
+                a,b,_,_,_ = self._gap_view[gi]
+                if b <= a + 1e-12:
+                    self.cannot_mask_pairs.add((j, gi)); continue
+                trial = {k: v.copy() for k, v in self.current_gaps.items()}
+                orig = trial["pipe"]
+                trial["pipe"] = [(a,b)]
+                placed = place_normal_in_gaps(j, trial)
+                if placed is None:
+                    self.cannot_mask_pairs.add((j, gi))
+
+    def _build_state(self):
+        job_feats = np.stack([self._job_feat(j) for j in normal_indices], axis=0)  # [N, F_j]
+        gap_feats = np.array(self._pipe_gap_feats(), dtype=np.float32)             # [K, F_g]
+        mask = np.zeros((len(normal_indices), self.topk), dtype=np.float32)
+        for i,j in enumerate(normal_indices):
+            for gi in range(self.topk):
+                if (j, gi) in self.cannot_mask_pairs:
+                    mask[i, gi] = 1.0
+        return job_feats, gap_feats, mask
+
+    def step(self, action_ij: Tuple[int,int]):
+        ji, gi = action_ij
+        job = normal_indices[ji]
+        if (job in self.inserted) or ((job, gi) in self.cannot_mask_pairs):
+            return self._build_state(), -1.0, False, {}
+
+        a,b,_,_,_ = self._gap_view[gi]
+        trial = {k: v.copy() for k, v in self.current_gaps.items()}
+        trial["pipe"] = [(a,b)]
+        placed = place_normal_in_gaps(job, trial)
+        if placed is None:
+            self.cannot_mask_pairs.add((job, gi))
+            return self._build_state(), -1.0, False, {}
+
+        self.current_gaps = trial
+        self.inserted[job] = placed
+
+        # 奖励：即时净利润 - 延期罚金（与基础版一致）
+        pb = float(np.sum(orders[job]["proc_body"]))
+        pc = float(np.sum(orders[job]["proc_cabinet"]))
+        pp = float(orders[job]["proc_pipe"])
+        profit = float(orders[job]["profit"]) - float(orders[job]["AC"]) * (pb + pc + pp)
+        late   = max(0.0, placed["C_pipe"] - float(orders[job]["due"]))
+        reward = profit - late * float(orders[job]["penalty"])
+
+        self._rebuild_masks()
+        total_pairs = len(normal_indices) * self.topk
+        done = (len(self.inserted) >= len(normal_indices)) or (len(self.cannot_mask_pairs) >= total_pairs)
+        return self._build_state(), reward, done, {}
+
+    def finalize_priority(self) -> Tuple[np.ndarray, float]:
+        x = np.zeros((len(normal_indices),), dtype=np.float32)
+        base = 10.0
+        for i, j in enumerate(normal_indices):
+            if j in self.inserted: x[i] = base
+        _, _, _, _, info = construct_schedule(priority_normals=x, tail_rule="WSPT")
+        PT = float(sum(max(0.0, self.Z - float(info["f_values"][a])) for a in SCENARIO_AS))
+        return x, PT
+
+# ============== Dueling Two-Tower Q 网络 + Double DQN ==============
+class DuelingTwoTowerQ(nn.Module):
+    def __init__(self, job_dim:int, gap_dim:int, hidden:int=128):
+        super().__init__()
+        self.job_mlp = nn.Sequential(
+            nn.Linear(job_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.gap_mlp = nn.Sequential(
+            nn.Linear(gap_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(hidden*2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)                    # Value
+        )
+        self.a_head = nn.Sequential(
+            nn.Linear(hidden*2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)                    # Advantage (per pair)
+        )
+
+    def forward(self, job_feats: torch.Tensor, gap_feats: torch.Tensor):
+        """
+        job_feats: [B, N, F_j]
+        gap_feats: [B, K, F_g]
+        return Q:  [B, N, K]
+        """
+        B, N, Fj = job_feats.shape
+        K, Fg = gap_feats.shape[1], gap_feats.shape[2]
+        J = self.job_mlp(job_feats)   # [B,N,H]
+        G = self.gap_mlp(gap_feats)   # [B,K,H]
+        J2 = J.unsqueeze(2).expand(-1, -1, K, -1)  # [B,N,K,H]
+        G2 = G.unsqueeze(1).expand(-1, N, -1, -1)  # [B,N,K,H]
+        X  = torch.cat([J2, G2], dim=-1)           # [B,N,K,2H]
+        V  = self.v_head(X)                        # [B,N,K,1]
+        A  = self.a_head(X)                        # [B,N,K,1]
+        Q  = V + (A - A.mean(dim=(1,2), keepdim=True))  # dueling 聚合
+        return Q.squeeze(-1)                       # [B,N,K]
+
+# ============== 优先经验回放 PER（比例法） ==============
+class PERBuffer:
+    def __init__(self, capacity:int, alpha:float=PER_ALPHA):
+        self.alpha = alpha
+        self.capacity = capacity
+        self.data = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+
+    def __len__(self): return len(self.data)
+
+    def push(self, item, priority:float=None):
+        if len(self.data) < self.capacity:
+            self.data.append(item)
+        else:
+            self.data[self.pos] = item
+        if priority is None:
+            p = np.max(self.priorities[:len(self.data)]) if self.data else 1.0
+        else:
+            p = float(priority)
+        self.priorities[self.pos] = p
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size:int, beta:float):
+        if len(self.data) == self.capacity:
+            pr = self.priorities
+        else:
+            pr = self.priorities[:len(self.data)]
+        probs = pr ** self.alpha
+        probs = probs / probs.sum()
+        idx = np.random.choice(len(self.data), batch_size, p=probs)
+        samples = [self.data[i] for i in idx]
+        # 重要性修正
+        weights = (len(self.data) * probs[idx]) ** (-beta)
+        weights = weights / weights.max()
+        return samples, idx, weights.astype(np.float32)
+
+    def update_priorities(self, idxs, new_prios):
+        for i, p in zip(idxs, new_prios):
+            self.priorities[i] = float(p) + PER_EPS
+
+# ============== 训练主流程（Stage-B，仅使用你给定 T） ==============
+def dqn_lns_twotower_plus_train(T_value: float = T_TARGET):
+    # 初始环境，拿到维度
+    env = GapEnv2DPlus(Z_for_PT=T_value, topk_pipe_gaps=TOPK_PIPE_GAPS)
+    jf, gf, mask = env.reset()
+    N, Fj = jf.shape
+    K, Fg = gf.shape
+
+    net = DuelingTwoTowerQ(job_dim=Fj, gap_dim=Fg, hidden=128).to(DEVICE)
+    tgt = DuelingTwoTowerQ(job_dim=Fj, gap_dim=Fg, hidden=128).to(DEVICE)
+    tgt.load_state_dict(net.state_dict())
+    opt = optim.Adam(net.parameters(), lr=LR)
+    buf = PERBuffer(REPLAY_SIZE)
+
+    epsilon = EPSILON_START
+    beta = PER_BETA_START
+    best_PT = float('inf'); best_x = None
+
+    pt_curve, loss_curve, eps_curve = [], [], []
+    ruin_ratio = LNS_RUIN_RATIO_INIT
+    no_improve = 0
+
+    step = 0
+    bar = tqdm(range(1, ITERS_B+1), desc="Stage B: DQN+LNS++ (2D, PER, Dueling, Double)", ncols=0)
+    for it in bar:
+        env = GapEnv2DPlus(Z_for_PT=T_value, topk_pipe_gaps=TOPK_PIPE_GAPS,
+                           prefill=PREFILL_GREEDY, prefill_ratio=PREFILL_RATIO)
+        state = env.reset()
+        done = False
+        ep_loss_acc = 0.0; ep_loss_cnt = 0
+        ep_reward = 0.0
+
+        while not done:
+            jf, gf, mask = state
+            jf_t = torch.tensor(jf[None, ...], dtype=torch.float32, device=DEVICE)
+            gf_t = torch.tensor(gf[None, ...], dtype=torch.float32, device=DEVICE)
+            Q = net(jf_t, gf_t).detach().cpu().numpy()[0]  # [N,K]
+            Q_masked = Q.copy()
+            Q_masked[mask > 0.5] = -1e30
+            # 终止：无合法动作
+            if np.all(Q_masked < -1e20):
+                buf.push((state, None, 0.0, state, True))
+                break
+
+            # ε-greedy 采样二维动作
+            if np.random.rand() < epsilon:
+                valid_pairs = np.argwhere(Q_masked > -1e20)
+                pick = valid_pairs[np.random.randint(0, len(valid_pairs))]
+                a = (int(pick[0]), int(pick[1]))
+            else:
+                idx = np.unravel_index(np.argmax(Q_masked), Q_masked.shape)
+                a = (int(idx[0]), int(idx[1]))
+
+            next_state, reward, done, _ = env.step(a)
+            ep_reward += reward
+            # 暂时优先级用 |reward|
+            buf.push((state, a, reward, next_state, done), priority=abs(reward)+1e-3)
+            state = next_state
+
+            # 训练
+            if len(buf) >= BATCH_SIZE:
+                batch, idxs, weights = buf.sample(BATCH_SIZE, beta)
+                # 打包
+                s_j, s_g, a_j, a_g, r_t, d_t, ns_j, ns_g = [], [], [], [], [], [], [], []
+                for (s, a, r, ns, d) in batch:
+                    jf, gf, _ = s
+                    s_j.append(jf); s_g.append(gf)
+                    if a is None:  a_j.append(-1); a_g.append(-1)
+                    else:          a_j.append(a[0]); a_g.append(a[1])
+                    r_t.append(r); d_t.append(1.0 if d else 0.0)
+                    jf2, gf2, _ = ns
+                    ns_j.append(jf2); ns_g.append(gf2)
+
+                s_j = torch.tensor(np.stack(s_j), dtype=torch.float32, device=DEVICE)
+                s_g = torch.tensor(np.stack(s_g), dtype=torch.float32, device=DEVICE)
+                a_j = torch.tensor(np.array(a_j), dtype=torch.long, device=DEVICE)
+                a_g = torch.tensor(np.array(a_g), dtype=torch.long, device=DEVICE)
+                r_t = torch.tensor(np.array(r_t), dtype=torch.float32, device=DEVICE)
+                d_t = torch.tensor(np.array(d_t), dtype=torch.float32, device=DEVICE)
+                ns_j = torch.tensor(np.stack(ns_j), dtype=torch.float32, device=DEVICE)
+                ns_g = torch.tensor(np.stack(ns_g), dtype=torch.float32, device=DEVICE)
+                w_t  = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+
+                q_pred = net(s_j, s_g)                    # [B,N,K]
+                with torch.no_grad():
+                    # Double DQN：在线网选 argmax，目标网估值
+                    q_next_online = net(ns_j, ns_g)        # [B,N,K]
+                    next_idx = q_next_online.argmax(dim=1, keepdim=False)  # [B,K] -> 取 flatten 不方便
+                    # 我们转成 [B] 的最大值（全局 max over N,K）
+                    # 近似：直接 amax 也能工作（更快）
+                    q_next_tgt = tgt(ns_j, ns_g).amax(dim=(1,2))          # [B]
+
+                # gather q(s,a)
+                B = q_pred.shape[0]
+                q_sa = torch.zeros((B,), dtype=torch.float32, device=DEVICE)
+                valid = (a_j >= 0) & (a_g >= 0)
+                if valid.any():
+                    idx = valid.nonzero(as_tuple=True)[0]
+                    q_sa[idx] = q_pred[idx, a_j[idx], a_g[idx]]
+
+                target = r_t + (1.0 - d_t) * GAMMA * q_next_tgt
+                td = (q_sa - target).detach().abs().cpu().numpy()
+                buf.update_priorities(idxs, td + 1e-3)
+
+                loss = ((q_sa - target)**2 * w_t).mean()
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+                opt.step()
+
+                ep_loss_acc += float(loss.item()); ep_loss_cnt += 1
+                step += 1
+
+                # 目标网络更新
+                if TARGET_UPDATE_EVERY > 0:
+                    if step % TARGET_UPDATE_EVERY == 0:
+                        tgt.load_state_dict(net.state_dict())
+                else:
+                    # 软更新
+                    with torch.no_grad():
+                        for p_t, p in zip(tgt.parameters(), net.parameters()):
+                            p_t.data.mul_(1.0 - TAU_SOFT).add_(TAU_SOFT * p.data)
+
+        # 一个 episode 完成：尾部 WSPT，计算 PT
+        x, PT = env.finalize_priority()
+        pt_curve.append(PT)
+        eps_curve.append(epsilon)
+
+        if ep_loss_cnt > 0:
+            loss_curve.append(ep_loss_acc / ep_loss_cnt)
+        else:
+            loss_curve.append(0.0)
+
+        # 自适应 LNS 破坏强度（这里我们从零重建，参数保留作为钩子）
+        if PT + 1e-9 < best_PT:
+            best_PT = PT; best_x = x.copy()
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= NO_IMPROVE_PATIENCE:
+                # 提升探索（增大破坏强度；若你改为“只重建部分”，这里生效）
+                ruin_ratio = min(LNS_RUIN_RATIO_MAX, ruin_ratio * 1.25)
+                no_improve = 0
+
+        epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+        beta = min(PER_BETA_END, beta * PER_BETA_DECAY)
+
+        bar.set_postfix_str(
+            f"PT_best={best_PT:.1f}, eps={epsilon:.3f}, beta={beta:.2f}, "
+            f"epR={ep_reward:.1f}, loss={(loss_curve[-1] if loss_curve else 0):.3f}"
+        )
+
+    # 学习曲线
+    plt.figure(figsize=(6,4)); plt.plot(pt_curve, lw=1.5)
+    plt.xlabel("Episode"); plt.ylabel("PT (lower better)")
+    plt.title("Stage B: DQN+LNS++ PT Curve"); plt.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig("stageB_DQN_LNSpp_PT.png", dpi=150)
+
+    plt.figure(figsize=(6,4)); plt.plot(loss_curve, lw=1.5)
+    plt.xlabel("Update step (episode-avg)"); plt.ylabel("Loss")
+    plt.title("DQN Training Loss (episode avg)"); plt.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig("stageB_DQN_LNSpp_Loss.png", dpi=150)
+
+    plt.figure(figsize=(6,4)); plt.plot(eps_curve, lw=1.5)
+    plt.xlabel("Episode"); plt.ylabel("Epsilon")
+    plt.title("Epsilon Decay"); plt.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig("stageB_DQN_LNSpp_Eps.png", dpi=150)
+
+    # 落盘最优
+    if best_x is not None:
+        np.save("best_priority_normals.npy", best_x)
+        torch.save({"model": net.state_dict()}, "dqn_lnspp_best.pt")
+        print("[Saved] best_priority_normals.npy & dqn_lnspp_best.pt")
+
+    return best_x, best_PT, {"PT": pt_curve, "loss": loss_curve, "eps": eps_curve}
+
+def main():
+    print(f"Use given T (Z) = {T_TARGET:.3f}")
+    best_x, best_PT, curves = dqn_lns_twotower_plus_train(T_value=T_TARGET)
+
+    # 复现最优解摘要
+    pb, pc, pp, plan, info = construct_schedule(priority_normals=best_x, tail_rule="WSPT")
+    print("\n=== Final schedule summary (DQN+LNS++) ===")
+    print(f"Best PT = {best_PT:.2f}")
+    print(f"Makespan = {info['makespan']:.2f}")
+    print(f"Total Profit = {info['total_profit']:.2f}")
+    for a in sorted(info["f_values"].keys()):
+        print(f"a={a:.2f} -> f(a)={info['f_values'][a]:.2f}")
+
+if __name__ == "__main__":
+    main()
