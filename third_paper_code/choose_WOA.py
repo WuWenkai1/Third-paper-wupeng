@@ -1,207 +1,221 @@
-# woa_selection_3machines.py
+# -*- coding: utf-8 -*-
 import numpy as np
-from typing import Dict, List, Tuple
-from parameter import selection_ds, orders  # 需要：selection_ds(含 ids, release, due, profit, AC)，以及 orders(含三线工时)
+from typing import Callable, Tuple, List
+from tqdm import tqdm
 
-# =========================
-# 1) 数据适配（取三条线工时 & 计算净利润）
-# =========================
-def build_data_3m(ds: Dict):
-    ids = list(ds["ids"])
-    r   = np.array(ds["release"], dtype=float)
-    d   = np.array(ds["due"],     dtype=float)
-    prof= np.array(ds["profit"],  dtype=float)
-    AC  = np.array(ds["AC"],      dtype=float)
+# 统一接口：optimize(eval_fn, n_dim, iters, pop_size, seed)
+# 约定：eval_fn(x: np.ndarray, rng: np.random.Generator) -> float，返回“要最小化”的值
+# 所有算法都输出：(best_value, best_x, curve)，curve 为每代 best 的轨迹
 
-    id2order = {o["id"]: o for o in orders}
-    Pb = np.array([float(sum(id2order[j]["proc_body"]))     for j in ids], dtype=float)
-    Pe = np.array([float(sum(id2order[j]["proc_cabinet"]))  for j in ids], dtype=float)
-    Pp = np.array([float(id2order[j]["proc_pipe"])          for j in ids], dtype=float)
-
-    # 净利润（接单后产生的收益）
-    w = prof - AC * (Pb + Pe + Pp)
-    return ids, r, d, Pb, Pe, Pp, w
-
-# =========================
-# 2) 三机 SSGS 解码（带“选择或跳过”逻辑）
-# =========================
-def decode_schedule_by_perm_3m(perm_idx: List[int],
-                               ids: List[int],
-                               r: np.ndarray, d: np.ndarray,
-                               Pb: np.ndarray, Pe: np.ndarray, Pp: np.ndarray,
-                               w:  np.ndarray,
-                               accept_negative: bool=False):
-    """
-    根据 perm_idx 的顺序尝试接单：
-      - 本体/电柜各单机：S_b=max(t_b,r), C_b=S_b+P_b；S_e=max(t_e,r), C_e=S_e+P_e
-      - 装配线：S_p=max(t_p, C_b, C_e), C_p=S_p+P_p
-      - 若 C_p<=d 且(accept_negative或w>0)，则接单并推进 t_b,t_e,t_p；否则跳过且不耗时
-    返回：
-      obj（净利润）, selected_ids, schedule{ID: (Sb,Cb, Se,Ce, Sp,Cp)}
-    """
-    tb = te = tp = 0.0
-    obj = 0.0
-    selected: List[int] = []
-    sched: Dict[int, Tuple[float,float,float,float,float,float]] = {}
-
-    for idx in perm_idx:
-        j = ids[idx]
-        Sb = max(tb, r[idx]);   Cb = Sb + Pb[idx]
-        Se = max(te, r[idx]);   Ce = Se + Pe[idx]
-        Sp = max(tp, max(Cb, Ce)); Cp = Sp + Pp[idx]
-
-        feasible = (Cp <= d[idx]) and (accept_negative or w[idx] > 0.0)
-        if feasible:
-            selected.append(j)
-            sched[j] = (Sb, Cb, Se, Ce, Sp, Cp)
-            tb, te, tp = Cb, Ce, Cp
-            obj += w[idx]
-        # 不可行/不盈利：跳过（不推进时间）
-
-    return obj, selected, sched
-
-# =========================
-# 3) 优先级→排列（降序；用极微抖动打破平局）
-# =========================
-def priority_to_perm(priority: np.ndarray, rng=None) -> List[int]:
-    if rng is not None:
-        pr = priority + 1e-9 * rng.standard_normal(priority.size)
-    else:
-        pr = priority
-    return np.argsort(-pr, kind="mergesort").tolist()
-
-# =========================
-# 4) 鲸鱼算法（WOA）主过程
-# =========================
-def solve_selection_woa_3m(ds: Dict,
-                           pack_size: int = 50,
-                           iterations: int = 1500,
-                           seed: int = 2025,
-                           accept_negative: bool = False,
-                           log_every: int = 50):
-    """
-    连续编码：长度 n 的优先级向量 x∈[0,1]^n
-    更新规则：WOA 三种机制（围捕、螺旋、搜索）
-    """
+# ---------------- GWO：灰狼优化 ----------------
+def gwo_optimize(eval_fn: Callable[[np.ndarray, np.random.Generator], float],
+                 n_dim: int, iters: int, pop_size: int, seed: int = 12
+                 ) -> Tuple[float, np.ndarray, List[float]]:
     rng = np.random.default_rng(seed)
-    ids, r, d, Pb, Pe, Pp, w = build_data_3m(ds)
-    n = len(ids)
-    if n == 0:
-        return {"selected_ids": [], "schedule": {}, "obj": 0.0, "best_priority": []}
+    X = rng.standard_normal((pop_size, n_dim))
+    fit = np.array([eval_fn(X[i], rng) for i in tqdm(range(pop_size), desc="GWO init", ncols=0)])
 
-    # --- 初始化种群（含两只启发式个体）
-    pop = rng.random((pack_size, n))
-    fit = np.empty(pack_size, dtype=float)
+    def top3():
+        idx = np.argsort(fit)
+        a, b = idx[0], idx[1]
+        d = idx[2] if len(idx) > 2 else b
+        return int(a), int(b), int(d)
 
-    # 启发式1：单位时间收益 ratio = w / (Pb+Pe+Pp)
-    tot_p = Pb + Pe + Pp
-    ratio = np.where(tot_p > 0, w / tot_p, -1e9)
-    perm1 = np.argsort(-ratio, kind="mergesort")
-    pop[0, perm1] = np.linspace(1.0, 0.0, n)
+    a_idx, b_idx, d_idx = top3()
+    best = float(fit[a_idx]); best_x = X[a_idx].copy()
+    curve = [best]
 
-    # 启发式2：EDD
-    perm2 = np.argsort(d, kind="mergesort")
-    pop[1, perm2] = np.linspace(1.0, 0.0, n)
+    bar = tqdm(range(1, iters+1), desc="GWO", ncols=0)
+    for t in bar:
+        a = 2 - 2*(t/iters)
+        Xn = np.empty_like(X); fn = np.empty_like(fit)
+        for i in range(pop_size):
+            r1, r2, r3 = rng.random(n_dim), rng.random(n_dim), rng.random(n_dim)
+            A1, C1 = 2*a*r1 - a, 2*rng.random(n_dim)
+            A2, C2 = 2*a*r2 - a, 2*rng.random(n_dim)
+            A3, C3 = 2*a*r3 - a, 2*rng.random(n_dim)
+            X1 = X[a_idx] - A1*np.abs(C1*X[a_idx] - X[i])
+            X2 = X[b_idx] - A2*np.abs(C2*X[b_idx] - X[i])
+            X3 = X[d_idx] - A3*np.abs(C3*X[d_idx] - X[i])
+            Xi = (X1 + X2 + X3)/3.0
+            Xn[i] = Xi
+            fn[i] = eval_fn(Xn[i], rng)
 
-    def fitness_of(prio_vec: np.ndarray) -> float:
-        perm = priority_to_perm(prio_vec, rng=rng)
-        obj, _, _ = decode_schedule_by_perm_3m(perm, ids, r, d, Pb, Pe, Pp, w, accept_negative)
-        return obj
+        worst = int(np.argmax(fn))
+        Xn[worst] = best_x.copy(); fn[worst] = best
 
-    for i in range(pack_size):
-        fit[i] = fitness_of(pop[i])
+        X, fit = Xn, fn
+        a_idx, b_idx, d_idx = top3()
+        if fit[a_idx] < best - 1e-12:
+            best = float(fit[a_idx]); best_x = X[a_idx].copy()
+        curve.append(best)
+        bar.set_postfix_str(f"best={best:.3f}")
+    return best, best_x, curve
 
-    # 全局最优
-    best_idx = int(np.argmax(fit))
-    X_best = pop[best_idx].copy()
-    f_best = float(fit[best_idx])
-    # 保存一份 best 的可读结果
-    perm = priority_to_perm(X_best, rng=rng)
-    _, best_selected, best_sched = decode_schedule_by_perm_3m(perm, ids, r, d, Pb, Pe, Pp, w, accept_negative)
 
-    # --- 主循环
-    b = 1.0  # WOA 螺旋常数
-    for t in range(1, iterations + 1):
-        # a 从 2 → 0 线性下降
-        a = 2.0 * (1 - t / iterations)
+# ---------------- PSO：粒子群 ----------------
+def pso_optimize(eval_fn: Callable[[np.ndarray, np.random.Generator], float],
+                 n_dim: int, iters: int, pop_size: int, seed: int = 12,
+                 w: float = 0.72, c1: float = 1.49, c2: float = 1.49
+                 ) -> Tuple[float, np.ndarray, List[float]]:
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((pop_size, n_dim))
+    V = rng.standard_normal((pop_size, n_dim)) * 0.1
+    fit = np.array([eval_fn(X[i], rng) for i in tqdm(range(pop_size), desc="PSO init", ncols=0)])
 
-        for i in range(pack_size):
-            X = pop[i]
-            r1 = rng.random(n)
-            r2 = rng.random(n)
-            A  = 2 * a * r1 - a
-            C  = 2 * r2
-            p  = rng.random()          # 选择概率（标量）
-            l  = rng.uniform(-1.0, 1.0)  # 螺旋参数（标量）
+    pbest = X.copy(); pbest_fit = fit.copy()
+    g = int(np.argmin(fit)); gbest = X[g].copy(); gbest_fit = float(fit[g])
+    curve = [gbest_fit]
 
-            if p < 0.5:
-                if np.all(np.abs(A) < 1.0):
-                    # Exploitation：围绕当前最优
-                    D = np.abs(C * X_best - X)
-                    X_new = X_best - A * D
-                else:
-                    # Exploration：参考随机个体
-                    rand_idx = rng.integers(0, pack_size)
-                    X_rand = pop[rand_idx]
-                    D = np.abs(C * X_rand - X)
-                    X_new = X_rand - A * D
+    bar = tqdm(range(1, iters+1), desc="PSO", ncols=0)
+    for _ in bar:
+        r1 = rng.random((pop_size, n_dim))
+        r2 = rng.random((pop_size, n_dim))
+        V = w*V + c1*r1*(pbest - X) + c2*r2*(gbest - X)
+        X = X + V
+        fit = np.array([eval_fn(X[i], rng) for i in range(pop_size)])
+
+        improved = fit < pbest_fit
+        pbest[improved] = X[improved]
+        pbest_fit[improved] = fit[improved]
+
+        g = int(np.argmin(fit))
+        if fit[g] < gbest_fit - 1e-12:
+            gbest_fit = float(fit[g]); gbest = X[g].copy()
+
+        curve.append(gbest_fit)
+        bar.set_postfix_str(f"best={gbest_fit:.3f}")
+    return gbest_fit, gbest, curve
+
+
+# ---------------- VNS：可变邻域搜索（简单实现） ----------------
+def vns_optimize(eval_fn: Callable[[np.ndarray, np.random.Generator], float],
+                 n_dim: int, iters: int, pop_size: int, seed: int = 12
+                 ) -> Tuple[float, np.ndarray, List[float]]:
+    rng = np.random.default_rng(seed)
+
+    def local_search(x):
+        fx = eval_fn(x, rng)
+        for k in [1.0, 0.5, 0.2, 0.1]:
+            for _ in range(10):
+                y = x + rng.standard_normal(x.shape)*k
+                # 少量维度随机重置
+                mask = rng.random(x.shape) < 0.05
+                if mask.any():
+                    y[mask] = rng.standard_normal(np.count_nonzero(mask))
+                fy = eval_fn(y, rng)
+                if fy < fx - 1e-12:
+                    x, fx = y, fy
+        return fx, x
+
+    X = [rng.standard_normal(n_dim) for _ in range(pop_size)]
+    F = [eval_fn(x, rng) for x in tqdm(X, desc="VNS init", ncols=0)]
+    g = int(np.argmin(F)); gbest, gfit = X[g].copy(), float(F[g])
+    curve = [gfit]
+
+    bar = tqdm(range(1, iters+1), desc="VNS", ncols=0)
+    for _ in bar:
+        s = int(rng.integers(0, pop_size))
+        f2, x2 = local_search(X[s])
+        X[s], F[s] = x2, f2
+        if f2 < gfit - 1e-12:
+            gfit, gbest = f2, x2.copy()
+        curve.append(gfit)
+        bar.set_postfix_str(f"best={gfit:.3f}")
+    return gfit, gbest, curve
+
+
+# ---------------- AO：Aquila Optimizer（天鹰算法，简实现） ----------------
+def ao_optimize(eval_fn: Callable[[np.ndarray, np.random.Generator], float],
+                n_dim: int, iters: int, pop_size: int, seed: int = 12
+                ) -> Tuple[float, np.ndarray, List[float]]:
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((pop_size, n_dim))
+    fit = np.array([eval_fn(X[i], rng) for i in tqdm(range(pop_size), desc="AO init", ncols=0)])
+    g = int(np.argmin(fit)); gbest = X[g].copy(); gbest_fit = float(fit[g])
+    curve = [gbest_fit]
+
+    bar = tqdm(range(1, iters+1), desc="AO", ncols=0)
+    for t in bar:
+        # AO 常见四种策略的简化混合（探索/开采）
+        e = 1 - (t/iters)  # 收缩因子
+        Xn = np.empty_like(X); fn = np.empty_like(fit)
+        for i in range(pop_size):
+            r1, r2 = rng.random(n_dim), rng.random(n_dim)
+            if rng.random() < 0.5:
+                # Exploration：广域搜索（带全局最优牵引）
+                A = rng.normal(0, 1, n_dim)
+                Xi = gbest + e*(r1*(gbest - A*X[i]))
             else:
-                # Bubble-net：螺旋更新
-                D_prime = np.abs(X_best - X)
-                X_new = D_prime * np.exp(b * l) * np.cos(2 * np.pi * l) + X_best
+                # Exploitation：局部搜索（随机个体 + Levy/高斯）
+                j = int(rng.integers(0, pop_size))
+                step = rng.normal(0, 1, n_dim) * e
+                Xi = X[j] + step*(gbest - X[i])
+            Xn[i] = Xi
+            fn[i] = eval_fn(Xn[i], rng)
 
-            # 轻微高斯扰动 + 截断
-            sigma = 0.01 * (1 - t / iterations)  # 随代次收敛
-            X_new += rng.normal(0.0, sigma, size=n)
-            X_new = np.clip(X_new, 0.0, 1.0)
+        # 精英保留
+        worst = int(np.argmax(fn))
+        Xn[worst] = gbest.copy(); fn[worst] = gbest_fit
 
-            f_new = fitness_of(X_new)
-            # 贪婪替换（允许持平替换，便于爬出平台）
-            if f_new >= fit[i]:
-                pop[i] = X_new
-                fit[i] = f_new
+        X, fit = Xn, fn
+        g = int(np.argmin(fit))
+        if fit[g] < gbest_fit - 1e-12:
+            gbest_fit = float(fit[g]); gbest = X[g].copy()
 
-        # 刷新全局最优
-        cur_best = int(np.argmax(fit))
-        if fit[cur_best] > f_best + 1e-12:
-            f_best = float(fit[cur_best])
-            X_best = pop[cur_best].copy()
-            perm = priority_to_perm(X_best, rng=rng)
-            _, best_selected, best_sched = decode_schedule_by_perm_3m(
-                perm, ids, r, d, Pb, Pe, Pp, w, accept_negative
-            )
+        curve.append(gbest_fit)
+        bar.set_postfix_str(f"best={gbest_fit:.3f}")
+    return gbest_fit, gbest, curve
 
-        if (log_every is not None) and (t % log_every == 0):
-            print(f"[WOA-3M] iter={t:4d}  best_obj={f_best:.1f}")
 
-    return {
-        "selected_ids": best_selected,
-        "schedule": best_sched,   # {ID: (Sb,Cb, Se,Ce, Sp,Cp)}
-        "obj": f_best,
-        "best_priority": X_best
-    }
+# ---------------- WOA：Whale Optimization Algorithm（鲸鱼算法，简实现） ----------------
+def woa_optimize(eval_fn: Callable[[np.ndarray, np.random.Generator], float],
+                 n_dim: int, iters: int, pop_size: int, seed: int = 12
+                 ) -> Tuple[float, np.ndarray, List[float]]:
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((pop_size, n_dim))
+    fit = np.array([eval_fn(X[i], rng) for i in tqdm(range(pop_size), desc="WOA init", ncols=0)])
+    g = int(np.argmin(fit)); gbest = X[g].copy(); gbest_fit = float(fit[g])
+    curve = [gbest_fit]
 
-# =========================
-# 5) 运行示例
-# =========================
-if __name__ == "__main__":
-    res = solve_selection_woa_3m(selection_ds,
-                                 pack_size=60,
-                                 iterations=2000,
-                                 seed=10,
-                                 accept_negative=False,
-                                 log_every=100)
-    print("\n[WOA-3M] 选中的特殊订单ID：", sorted(res["selected_ids"]))
+    bar = tqdm(range(1, iters+1), desc="WOA", ncols=0)
+    for t in bar:
+        a = 2 - 2*(t/iters)  # 线性递减
+        Xn = np.empty_like(X); fn = np.empty_like(fit)
+        for i in range(pop_size):
+            p = rng.random()
+            A = 2*a*rng.random(n_dim) - a
+            C = 2*rng.random(n_dim)
+            if p < 0.5:
+                if np.linalg.norm(A, ord=2) < 1:
+                    # encircling
+                    D = np.abs(C*gbest - X[i])
+                    Xi = gbest - A*D
+                else:
+                    # search random prey
+                    j = int(rng.integers(0, pop_size))
+                    D = np.abs(C*X[j] - X[i])
+                    Xi = X[j] - A*D
+            else:
+                # spiral updating
+                b = 1.0
+                l = (rng.random(n_dim) - 0.5)*2  # in [-1,1]
+                Dp = np.abs(gbest - X[i])
+                Xi = Dp*np.exp(b*l)*np.cos(2*np.pi*l) + gbest
+            Xn[i] = Xi
+            fn[i] = eval_fn(Xn[i], rng)
 
-    # 按装配开始时间输出顺序
-    seq = sorted(res["selected_ids"], key=lambda j: res["schedule"][j][4])  # Sp 是第5个
-    print("[WOA-3M] 加工顺序（按装配开始）:")
-    for pos, j in enumerate(seq, 1):
-        Sb,Cb, Se,Ce, Sp,Cp = res["schedule"][j]
-        # 若想把编号映射为 1..(特殊订单数)，可减去普通订单数
-        # true_id = j - num_normal_orders
-        idx = selection_ds["ids"].index(j)
-        rj = selection_ds["release"][idx]; dj = selection_ds["due"][idx]
-        print(f"{pos:02d}. ID={j} | r={rj:.0f}, d={dj:.0f} | "
-              f"Sb={Sb:.1f}, Cb={Cb:.1f} ; Se={Se:.1f}, Ce={Ce:.1f} ; Sp={Sp:.1f}, Cp={Cp:.1f}")
-    print(f"[WOA-3M] 目标(净利润) = {res['obj']:.2f}")
+        # 精英保留
+        worst = int(np.argmax(fn))
+        Xn[worst] = gbest.copy(); fn[worst] = gbest_fit
+
+        X, fit = Xn, fn
+        g = int(np.argmin(fit))
+        if fit[g] < gbest_fit - 1e-12:
+            gbest_fit = float(fit[g]); gbest = X[g].copy()
+
+        curve.append(gbest_fit)
+        bar.set_postfix_str(f"best={gbest_fit:.3f}")
+    return gbest_fit, gbest, curve
+
+
