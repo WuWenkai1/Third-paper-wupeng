@@ -1,0 +1,525 @@
+# -*- coding: utf-8 -*-
+import math
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Dict, Optional, Deque
+from collections import deque
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ===== 读取你的模型封装（不修改）=====
+from Main_model import (
+    orders, normal_indices, SCENARIO_AS,
+    anchor_specials_and_gaps, place_normal_in_gaps, construct_schedule
+)
+
+# ===== 全局与超参 =====
+SEED = 12
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+T_TARGET = 409_865.500  # 你提供的 Z（a=0.5 的最优 f 值，用于计算 PT）
+
+# 训练/探索
+EPISODES = 1000                # 迭代次数（可先 300 验证流程）
+TOPK_PIPE_GAPS = 48           # 管线候选 gap 池（用于特征展示）
+CANDIDATE_K = 16              # 每个 job 实际开放的最紧可行 gap 数
+EPSILON_START = 0.20
+EPSILON_END   = 0.03
+EPSILON_DECAY = 0.995
+GAMMA = 0.98
+N_STEP = 3                    # n-step DQN
+LR    = 1e-3
+BATCH_SIZE = 128
+REPLAY_SIZE = 60000
+
+# Double DQN + 软更新
+TARGET_UPDATE_EVERY = 0       # 若=0则启用软更新
+TAU_SOFT = 0.01
+
+# 优先经验回放（PER）
+PER_ALPHA = 0.6
+PER_BETA_START = 0.4
+PER_BETA_END   = 1.0
+PER_BETA_DECAY = 0.997
+PER_EPS = 1e-6
+
+# 预填缝与早停
+PREFILL_GREEDY = False
+PREFILL_RATIO  = 0.5         # 预填 90% 普通单（WSPT × 可行性），加速冷启动
+NO_IMPROVE_PATIENCE = 120
+
+# LNS 后处理
+LNS_TRIALS = 40               # 每集结束的 destroy&repair 次数
+LNS_DESTROY_K = 8             # 随机移除的订单数
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ================= 环境（二维动作：选 (job_idx, gap_idx)） =================
+class GapEnv2DPlus:
+    """
+    改进要点：
+    - 奖励 = ΔPT（与最终目标一致，PT 越小越好）
+    - 候选 gap 精筛：每个 job 仅开放“可行且最紧”的前 CANDIDATE_K 个 gap
+    - 兜底插入：若选中的 gap 插入失败，尝试在“完整 gaps”里再插一次，避免经验全无效
+    - 强预填：reset 后先按 WSPT×可行性预塞一批普通单，确保经验中有正样本
+    """
+    def __init__(self, Z_for_PT: float, topk_pipe_gaps: int = TOPK_PIPE_GAPS,
+                 candidate_k: int = CANDIDATE_K,
+                 prefill: bool = PREFILL_GREEDY, prefill_ratio: float = PREFILL_RATIO):
+        self.Z = Z_for_PT
+        self.topk = topk_pipe_gaps
+        self.cand_k = candidate_k
+        self.prefill = prefill
+        self.prefill_ratio = prefill_ratio
+        self.N = len(normal_indices)
+        self.reset()
+
+    # ---------- 特征 ----------
+    def _job_feat(self, j:int) -> np.ndarray:
+        pb = float(np.sum(orders[j]["proc_body"]))
+        pc = float(np.sum(orders[j]["proc_cabinet"]))
+        pp = float(orders[j]["proc_pipe"])
+        r  = float(orders[j]["release"])
+        d  = float(orders[j]["due"])
+        w  = float(orders[j]["penalty"])
+        pr = float(orders[j]["profit"])
+        ac = float(orders[j]["AC"])
+        p_eff = max(pb, pc) + pp
+        slack = d - r - p_eff
+        profit_density = (pr - ac * (pb+pc+pp)) / max(1e-6, p_eff)
+        return np.array([pb, pc, pp, p_eff, r, d, w, pr, ac, slack, profit_density], dtype=np.float32)
+
+    def _pipe_gap_feats(self) -> list:
+        """
+        返回 TOPK gaps 的 (start, end, length, dist_to_0, dist_to_tail)
+        仅用于特征展示；动作可用性由 _topk_gaps_for_job 控制
+        """
+        gaps = self.current_gaps["pipe"]
+        gl = [(a,b,b-a) for (a,b) in gaps] if gaps else []
+        gl.sort(key=lambda x: x[2], reverse=True)
+        tail_c = max((b for (a,b) in gaps), default=0.0)
+        out = []
+        for (a,b,L) in gl[:self.topk]:
+            out.append((a, b, L, a, max(0.0, a - tail_c)))
+        while len(out) < self.topk:
+            out.append((0.0,0.0,0.0,0.0,0.0))
+        return out
+
+    def _ready_lb(self, j:int) -> float:
+        pb = float(np.sum(orders[j]["proc_body"]))
+        pc = float(np.sum(orders[j]["proc_cabinet"]))
+        return max(orders[j]["release"], 0.0) + max(pb, pc)
+
+    def _topk_gaps_for_job(self, j:int, K:int=None):
+        """返回该 job 的前 K 个“可行且更紧凑”的管线 gap（按 slack 升序）"""
+        if K is None: K = self.cand_k
+        pp = float(orders[j]["proc_pipe"])
+        ready_lb = self._ready_lb(j)
+        cand = []
+        for gi,(a,b) in enumerate(self.current_gaps["pipe"]):
+            s = max(a, ready_lb); e = s + pp
+            if e <= b + 1e-12:
+                slack = b - e
+                cand.append((gi, a, b, slack))
+        cand.sort(key=lambda x: x[3])  # 越紧越优先
+        return cand[:K]
+
+    # ---------- 预填（WSPT × 可行性） ----------
+    def _prefill_wspt_once(self):
+        cand = list(normal_indices)
+
+        def wspt(j):
+            p_eff = max(float(np.sum(orders[j]["proc_body"])),
+                        float(np.sum(orders[j]["proc_cabinet"]))) + float(orders[j]["proc_pipe"])
+            w = max(1e-9, float(orders[j]["penalty"]))
+            return p_eff / w
+
+        cand.sort(key=lambda j: (wspt(j), float(orders[j]["due"])))
+        k = int(self.prefill_ratio * len(cand))
+        for j in cand[:k]:
+            ok = False
+            for gi, a, b, _ in self._topk_gaps_for_job(j, K=self.cand_k):
+                trial = {kk: vv.copy() for kk, vv in self.current_gaps.items()}
+                trial["pipe"] = [(a, b)]
+                placed = place_normal_in_gaps(j, trial)
+                if placed is not None:
+                    self.current_gaps = trial
+                    self.inserted[j] = placed
+                    ok = True
+                    break
+            if not ok:
+                # 再试一次不限定 gap（完整 gaps）
+                trial2 = {kk: vv.copy() for kk, vv in self.current_gaps.items()}
+                placed2 = place_normal_in_gaps(j, trial2)
+                if placed2 is not None:
+                    self.current_gaps = trial2
+                    self.inserted[j] = placed2
+
+    # ---------- 状态与 PT ----------
+    def _build_state(self):
+        job_feats = np.stack([self._job_feat(j) for j in normal_indices], axis=0)  # [N, F_j]
+        gap_feats = np.array(self._pipe_gap_feats(), dtype=np.float32)             # [K, F_g]
+        mask = np.ones((len(normal_indices), self.topk), dtype=np.float32)         # 全部先屏蔽
+        for i,j in enumerate(normal_indices):
+            if j in self.inserted:
+                continue
+            # 只开放候选 gap
+            allow = {gi for (gi,_,_,_) in self._topk_gaps_for_job(j)}
+            for gi in allow:
+                if gi < self.topk:
+                    mask[i, gi] = 0.0
+        return job_feats, gap_feats, mask
+
+    def _pt_from_current(self):
+        x = np.zeros((len(normal_indices),), dtype=np.float32)
+        base = 10.0
+        for i, j in enumerate(normal_indices):
+            if j in self.inserted: x[i] = base
+        _, _, _, _, info = construct_schedule(priority_normals=x, tail_rule="WSPT")
+        PT = float(sum(max(0.0, self.Z - float(info["f_values"][a])) for a in SCENARIO_AS))
+        return PT
+
+    # ---------- 基本流程 ----------
+    def reset(self):
+        self.plan_spec, self.gaps = anchor_specials_and_gaps()
+        self.current_gaps = {k: v.copy() for k, v in self.gaps.items()}
+        self.inserted: Dict[int, Dict] = {}
+        if self.prefill:
+            self._prefill_wspt_once()
+        return self._build_state()
+
+    def step(self, action_ij: Tuple[int,int]):
+        ji, gi = action_ij
+        job = normal_indices[ji]
+
+        jf, gf, mask = self._build_state()
+        if mask[ji, gi] > 0.5:  # 被屏蔽的动作
+            return self._build_state(), -1.0, False, {}
+
+        a,b,_,_,_ = self._pipe_gap_feats()[gi]
+        pt_before = self._pt_from_current()
+
+        # 优先在指定 gap 试
+        trial = {k: v.copy() for k, v in self.current_gaps.items()}
+        trial["pipe"] = [(a,b)]
+        placed = place_normal_in_gaps(job, trial)
+        if placed is None:
+            # 兜底：完整 gaps
+            trial2 = {k: v.copy() for k, v in self.current_gaps.items()}
+            placed2 = place_normal_in_gaps(job, trial2)
+            if placed2 is None:
+                return self._build_state(), -1.0, False, {}
+            self.current_gaps = trial2
+            placed = placed2
+        else:
+            self.current_gaps = trial
+
+        self.inserted[job] = placed
+        pt_after = self._pt_from_current()
+        reward = pt_before - pt_after  # ΔPT（正数更好）
+
+        next_state = self._build_state()
+        # 终止：所有普通单都尝试过 or 没有可行动作
+        done = (len(self.inserted) >= len(normal_indices)) or (np.sum(next_state[2] < 0.5) == 0)
+        return next_state, reward, done, {}
+
+    def finalize_priority(self) -> Tuple[np.ndarray, float]:
+        x = np.zeros((len(normal_indices),), dtype=np.float32)
+        base = 10.0
+        for i, j in enumerate(normal_indices):
+            if j in self.inserted: x[i] = base
+        _, _, _, _, info = construct_schedule(priority_normals=x, tail_rule="WSPT")
+        PT = float(sum(max(0.0, self.Z - float(info["f_values"][a])) for a in SCENARIO_AS))
+        return x, PT
+
+
+# ================= 网络（Dueling Two-Tower Q） =================
+class DuelingTwoTowerQ(nn.Module):
+    def __init__(self, job_dim:int, gap_dim:int, hidden:int=128):
+        super().__init__()
+        self.job_mlp = nn.Sequential(
+            nn.Linear(job_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.gap_mlp = nn.Sequential(
+            nn.Linear(gap_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(hidden*2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+        self.a_head = nn.Sequential(
+            nn.Linear(hidden*2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, job_feats: torch.Tensor, gap_feats: torch.Tensor):
+        B, N, Fj = job_feats.shape
+        K, Fg = gap_feats.shape[1], gap_feats.shape[2]
+        J = self.job_mlp(job_feats)    # [B,N,H]
+        G = self.gap_mlp(gap_feats)    # [B,K,H]
+        J2 = J.unsqueeze(2).expand(-1, -1, K, -1)
+        G2 = G.unsqueeze(1).expand(-1, N, -1, -1)
+        X  = torch.cat([J2, G2], dim=-1)           # [B,N,K,2H]
+        V  = self.v_head(X)
+        A  = self.a_head(X)
+        Q  = V + (A - A.mean(dim=(1,2), keepdim=True))
+        return Q.squeeze(-1)                       # [B,N,K]
+
+
+# ================= 优先经验回放 PER =================
+class PERBuffer:
+    def __init__(self, capacity:int, alpha:float=PER_ALPHA):
+        self.alpha = alpha
+        self.capacity = capacity
+        self.data = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+    def __len__(self): return len(self.data)
+    def push(self, item, priority:float=None):
+        if len(self.data) < self.capacity: self.data.append(item)
+        else: self.data[self.pos] = item
+        p = np.max(self.priorities[:len(self.data)]) if (priority is None and self.data) else (priority if priority is not None else 1.0)
+        self.priorities[self.pos] = float(p)
+        self.pos = (self.pos + 1) % self.capacity
+    def sample(self, batch_size:int, beta:float):
+        pr = self.priorities[:len(self.data)]
+        probs = pr ** self.alpha; probs = probs / probs.sum()
+        idx = np.random.choice(len(self.data), batch_size, p=probs)
+        samples = [self.data[i] for i in idx]
+        weights = (len(self.data) * probs[idx]) ** (-beta)
+        return samples, idx, (weights / weights.max()).astype(np.float32)
+    def update_priorities(self, idxs, new_prios):
+        for i, p in zip(idxs, new_prios):
+            self.priorities[i] = float(p) + PER_EPS
+
+
+# ================= n-step 辅助（收集器） =================
+class NStepCollector:
+    def __init__(self, n:int, gamma:float):
+        self.n = n; self.gamma = gamma
+        self.buf: Deque = deque()
+    def push(self, transition):
+        # transition: (state, action, reward, next_state, done)
+        self.buf.append(transition)
+        if len(self.buf) < self.n: return None
+        R = 0.0; done = False; next_state = None
+        for i, (_, _, r, ns, d) in enumerate(self.buf):
+            R += (self.gamma ** i) * r
+            next_state = ns; done = d
+            if d: break
+        state, action, _, _, _ = self.buf[0]
+        self.buf.popleft()
+        return (state, action, R, next_state, done)
+    def flush(self):
+        out = []
+        while self.buf:
+            t = self.push((None, None, 0.0, None, True))
+            if t is not None: out.append(t)
+        return out
+
+
+# ================= LNS 后处理 =================
+def lns_improve(x_base: np.ndarray, current_pt_fn, trials:int=LNS_TRIALS, destroy_k:int=LNS_DESTROY_K):
+    best_x = x_base.copy()
+    best_pt = current_pt_fn(best_x)
+    pool = list(range(len(normal_indices)))
+    for _ in range(trials):
+        if len(pool) == 0: break
+        k = min(destroy_k, len(pool))
+        rem = random.sample(pool, k=k)
+        x_new = best_x.copy()
+        x_new[rem] = 0.0
+        # 重新构建：把被移除的按 WSPT × due 插回（实际上 construct_schedule 会做尝试）
+        _, _, _, _, info_new = construct_schedule(priority_normals=x_new, tail_rule="WSPT")
+        pt_new = float(sum(max(0.0, T_TARGET - float(info_new["f_values"][a])) for a in SCENARIO_AS))
+        if pt_new < best_pt - 1e-9:
+            best_pt, best_x = pt_new, x_new
+    return best_x, best_pt
+
+
+# ================= 训练主流程（最小化 PT） =================
+def train_stageB_dqn_lnspp(T_value: float = T_TARGET):
+    # 初始化一次以获维度
+    env = GapEnv2DPlus(Z_for_PT=T_value, topk_pipe_gaps=TOPK_PIPE_GAPS)
+    jf, gf, _ = env.reset()
+    N, Fj = jf.shape
+    K, Fg = gf.shape
+
+    net = DuelingTwoTowerQ(job_dim=Fj, gap_dim=Fg, hidden=128).to(DEVICE)
+    tgt = DuelingTwoTowerQ(job_dim=Fj, gap_dim=Fg, hidden=128).to(DEVICE)
+    tgt.load_state_dict(net.state_dict())
+    opt = optim.Adam(net.parameters(), lr=LR)
+    buf = PERBuffer(REPLAY_SIZE)
+
+    epsilon = EPSILON_START
+    beta = PER_BETA_START
+    best_PT = float('inf'); best_x = None
+
+    pt_curve, loss_curve, eps_curve = [], [], []
+
+    step = 0
+    no_improve = 0
+
+    bar = tqdm(range(1, EPISODES+1), desc="Stage B: DQN+LNS++ (ΔPT, n-step)", ncols=0)
+    for it in bar:
+        env = GapEnv2DPlus(Z_for_PT=T_value,
+                           topk_pipe_gaps=TOPK_PIPE_GAPS,
+                           candidate_k=CANDIDATE_K,
+                           prefill=PREFILL_GREEDY, prefill_ratio=PREFILL_RATIO)
+        state = env.reset()
+        collector = NStepCollector(N_STEP, GAMMA)
+
+        done = False
+        ep_loss_acc = 0.0; ep_loss_cnt = 0
+
+        while not done:
+            jf, gf, mask = state
+            jf_t = torch.tensor(jf[None, ...], dtype=torch.float32, device=DEVICE)
+            gf_t = torch.tensor(gf[None, ...], dtype=torch.float32, device=DEVICE)
+            Q = net(jf_t, gf_t).detach().cpu().numpy()[0]  # [N,K]
+
+            Q_masked = Q.copy(); Q_masked[mask > 0.5] = -1e30
+            if np.all(Q_masked < -1e20):
+                # 无可行动作，终止
+                break
+
+            # ε-greedy
+            if np.random.rand() < epsilon:
+                valid_pairs = np.argwhere(Q_masked > -1e20)
+                pick = valid_pairs[np.random.randint(0, len(valid_pairs))]
+                a = (int(pick[0]), int(pick[1]))
+            else:
+                idx = np.unravel_index(np.argmax(Q_masked), Q_masked.shape)
+                a = (int(idx[0]), int(idx[1]))
+
+            next_state, reward, done, _ = env.step(a)
+
+            nstep = collector.push((state, a, reward, next_state, done))
+            if nstep is not None:
+                buf.push(nstep, priority=abs(nstep[2])+1e-3)
+
+            state = next_state
+
+            # 学习
+            if len(buf) >= BATCH_SIZE:
+                batch, idxs, weights = buf.sample(BATCH_SIZE, beta)
+                s_j, s_g, a_j, a_g, r_t, d_t, ns_j, ns_g = [], [], [], [], [], [], [], []
+                for (s, a, r, ns, d) in batch:
+                    jf, gf, _ = s; jf2, gf2, _ = ns
+                    s_j.append(jf); s_g.append(gf)
+                    ns_j.append(jf2); ns_g.append(gf2)
+                    a_j.append(a[0]); a_g.append(a[1])
+                    r_t.append(r); d_t.append(1.0 if d else 0.0)
+
+                s_j = torch.tensor(np.stack(s_j), dtype=torch.float32, device=DEVICE)
+                s_g = torch.tensor(np.stack(s_g), dtype=torch.float32, device=DEVICE)
+                ns_j = torch.tensor(np.stack(ns_j), dtype=torch.float32, device=DEVICE)
+                ns_g = torch.tensor(np.stack(ns_g), dtype=torch.float32, device=DEVICE)
+                a_j = torch.tensor(np.array(a_j), dtype=torch.long, device=DEVICE)
+                a_g = torch.tensor(np.array(a_g), dtype=torch.long, device=DEVICE)
+                r_t = torch.tensor(np.array(r_t), dtype=torch.float32, device=DEVICE)
+                d_t = torch.tensor(np.array(d_t), dtype=torch.float32, device=DEVICE)
+                w_t = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+
+                q_pred = net(s_j, s_g)                          # [B,N,K]
+                with torch.no_grad():
+                    # Double DQN：在线网络选动作，目标网络估值
+                    q_next_online = net(ns_j, ns_g)             # [B,N,K]
+                    idx_best = q_next_online.view(q_next_online.size(0), -1).argmax(dim=1)
+                    iN = q_next_online.size(1); iK = q_next_online.size(2)
+                    aN = (idx_best // iK).unsqueeze(1)
+                    aK = (idx_best %  iK).unsqueeze(1)
+                    q_next_tgt = tgt(ns_j, ns_g)
+                    q_next = q_next_tgt.gather(1, aN).squeeze(1).gather(1, aK).squeeze(1)  # [B]
+
+                Bsz = q_pred.shape[0]
+                q_sa = q_pred[torch.arange(Bsz), a_j, a_g]
+                target = r_t + (1.0 - d_t) * (GAMMA ** N_STEP) * q_next
+
+                td = (q_sa - target).detach().abs().cpu().numpy()
+                buf.update_priorities(idxs, td + 1e-3)
+
+                loss = ((q_sa - target)**2 * w_t).mean()
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+                opt.step()
+
+                ep_loss_acc += float(loss.item()); ep_loss_cnt += 1
+
+                # 软更新
+                if TARGET_UPDATE_EVERY > 0:
+                    if step % TARGET_UPDATE_EVERY == 0:
+                        tgt.load_state_dict(net.state_dict())
+                else:
+                    with torch.no_grad():
+                        for p_t, p in zip(tgt.parameters(), net.parameters()):
+                            p_t.data.mul_(1.0 - TAU_SOFT).add_(TAU_SOFT * p.data)
+                step += 1
+
+        # 刷新残余 n-step
+        for t in collector.flush():
+            buf.push(t, priority=abs(t[2])+1e-3)
+
+        # 一集结束：把当前“已插入”的优先级向量取出，做 LNS 微调后评估 PT
+        x, PT = env.finalize_priority()
+
+        # LNS 后处理（可带来稳健下降）
+        def pt_fn(xx):
+            _, _, _, _, info = construct_schedule(priority_normals=xx, tail_rule="WSPT")
+            return float(sum(max(0.0, T_TARGET - float(info["f_values"][a])) for a in SCENARIO_AS))
+        x_lns, pt_lns = lns_improve(x, pt_fn, trials=LNS_TRIALS, destroy_k=LNS_DESTROY_K)
+        if pt_lns < PT: x, PT = x_lns, pt_lns
+
+        pt_curve.append(PT)
+        loss_curve.append(ep_loss_acc / max(1, ep_loss_cnt))
+        eps_curve.append(epsilon)
+
+        if PT + 1e-9 < best_PT:
+            best_PT = PT; best_x = x.copy(); no_improve = 0
+        else:
+            no_improve += 1
+
+        epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+        beta = min(PER_BETA_END, beta * PER_BETA_DECAY)
+
+        bar.set_postfix_str(f"PT_best={best_PT:.1f}, eps={epsilon:.3f}, loss={loss_curve[-1]:.3f}")
+
+        if no_improve >= NO_IMPROVE_PATIENCE:
+            print(f"[EarlyStop] no improvement for {NO_IMPROVE_PATIENCE} episodes.")
+            break
+
+    # 学习曲线
+    plt.figure(figsize=(6,4)); plt.plot(pt_curve, lw=1.6)
+    plt.xlabel("Episode"); plt.ylabel("PT (lower better)")
+    plt.title("Stage B: DQN+LNS++ PT Curve"); plt.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig("stageB_DQN_LNSpp_PT.png", dpi=150)
+
+    # 保存
+    if best_x is not None:
+        np.save("best_priority_normals.npy", best_x)
+        torch.save({"model": net.state_dict()}, "dqn_lnspp_best.pt")
+        torch.save({"PT": pt_curve, "loss": loss_curve, "eps": eps_curve}, "training_curves.pt")
+        print("[Saved] best_priority_normals.npy, dqn_lnspp_best.pt, training_curves.pt")
+    else:
+        print("[WARN] best_x is None, nothing saved.")
+
+    return best_x, best_PT, {"PT": pt_curve, "loss": loss_curve, "eps": eps_curve}
+
+
+def main():
+    print(f"Use given Z (T_target) = {T_TARGET:.3f}")
+    best_x, best_PT, curves = train_stageB_dqn_lnspp(T_value=T_TARGET)
+    if best_x is not None:
+        print(f"\n[Train Done] Best PT = {best_PT:.2f}")
+    else:
+        print("\n[Train Done] No feasible best_x captured.")
+
+if __name__ == "__main__":
+    main()
